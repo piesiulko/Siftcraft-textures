@@ -516,6 +516,15 @@
                 <button class="lang-btn" onclick="setLanguage('pl')">🇵🇱 Polski</button>
                 <button class="lang-btn" onclick="setLanguage('en')">🇬🇧 English</button>
                 <button class="lang-btn" onclick="clearAssetCache()">🔄 Pobierz pliki od nowa / Re-download files</button>
+                <label style="font-size:12px;color:#333;margin-top:8px;">🌱 Seed świata / World seed</label>
+                <input id="world-seed-input" type="number" step="1" style="margin:4px 0 6px 0;padding:6px;border-radius:6px;border:1px solid #999;">
+                <button class="lang-btn" onclick="applyWorldSeedSettings()">✅ Zastosuj seed / Apply seed</button>
+                <label style="font-size:12px;color:#333;margin-top:8px;">🎯 Render distance (8-32)</label>
+                <input id="render-distance-input" type="number" min="8" max="32" step="1" style="margin:4px 0 6px 0;padding:6px;border-radius:6px;border:1px solid #999;">
+                <label style="font-size:12px;color:#333;">⚡ Budżet kolumn/klatkę / Columns per frame (8-220)</label>
+                <input id="world-budget-input" type="number" min="8" max="220" step="1" style="margin:4px 0 6px 0;padding:6px;border-radius:6px;border:1px solid #999;">
+                <button class="lang-btn" onclick="applyPerformanceSettings()">🚀 Zastosuj wydajność / Apply performance</button>
+                <button class="lang-btn" id="debug-overlay-btn" onclick="toggleDebugOverlay()">📊 Debug HUD: OFF</button>
             </div>
             <div class="settings-col">
                 <h3>🧍 Skin / Skin</h3>
@@ -539,6 +548,7 @@
     <div id="hud-info">
         <div id="coordinates">X: 0 | Y: 0 | Z: 0</div>
         <div id="day-counter">Dzień: 0</div>
+        <div id="perf-debug" style="display:none;">FPS: -- | Bloki: 0 | Obiekty: 0</div>
         <div id="mp-info"></div>
     </div>
     <div id="break-progress-container"><div id="break-progress-bar"></div></div>
@@ -662,7 +672,13 @@
     </div>
 
     <script type="text/plain" id="game-code">
-        const RENDER_DISTANCE = 22;
+        const DEFAULT_RENDER_DISTANCE = 22;
+        const DEFAULT_WORLD_SEED = 20240611;
+        const UPDATE_STEP = 2;
+        let renderDistance = Math.max(8, Math.min(32, parseInt(localStorage.getItem('sift_render_distance') || DEFAULT_RENDER_DISTANCE, 10) || DEFAULT_RENDER_DISTANCE));
+        let worldSeed = (parseInt(localStorage.getItem('sift_world_seed') || DEFAULT_WORLD_SEED, 10) | 0) || DEFAULT_WORLD_SEED;
+        let worldColumnBudget = Math.max(8, Math.min(220, parseInt(localStorage.getItem('sift_world_budget') || '84', 10) || 84));
+        let showPerfDebug = localStorage.getItem('sift_show_perf_debug') === '1';
         const BLOCK_SIZE = 1;
         
         const BLOCKS = {
@@ -2546,14 +2562,34 @@
         //  GENERACJA ŚWIATA – nieskończona, deterministyczna (ten sam seed = ten sam świat)
         //  Duże wzgórza, jeziorka tylko od czasu do czasu, drzewa z pniem 2x2 (4 pnie obok siebie)
         // =====================================================================
-        const WORLD_SEED = 20240611;   // zmień liczbę, żeby dostać inny świat
         const WATER_LEVEL = 4;         // poziom wody w jeziorkach
         const WORLD_BOTTOM = -32;      // dno świata – pod graczem jest teraz gruba warstwa kamienia (jak w Minecraft)
         const WORLD_TOP = 64;          // do tej wysokości skanują dekoracje i findGroundY
         const LAKE_THRESHOLD = 0.80;   // im wyżej, tym rzadsze jeziora (0.74 = więcej, 0.83 = mniej)
+        const terrainCache = new Map();
+        const biomeCache = new Map();
+        const noiseCache = new Map();
+        const CACHE_LIMIT = 120000;
+
+        function cachePut(map, key, value) {
+            map.set(key, value);
+            if (map.size > CACHE_LIMIT) {
+                const first = map.keys().next();
+                if (!first.done) map.delete(first.value);
+            }
+            return value;
+        }
+        function clearWorldGenCaches() {
+            terrainCache.clear();
+            biomeCache.clear();
+            noiseCache.clear();
+            spireCellCache.clear();
+            boneCellCache.clear();
+            treeCellCache.clear();
+        }
 
         function hash2(ix, iz, salt) {
-            let h = (Math.imul(ix | 0, 374761393) ^ Math.imul(iz | 0, 668265263) ^ Math.imul((salt + WORLD_SEED) | 0, 1274126177)) | 0;
+            let h = (Math.imul(ix | 0, 374761393) ^ Math.imul(iz | 0, 668265263) ^ Math.imul((salt + worldSeed) | 0, 1274126177)) | 0;
             h = Math.imul(h ^ (h >>> 13), 1274126177);
             h ^= h >>> 16;
             return (h >>> 0) / 4294967296;
@@ -2581,21 +2617,44 @@
 
         // > 0 = biom Sift (turkusowa trawa), <= 0 = zwykła trawa. Duże plamy (~200 bloków), start gry zawsze w Sifcie.
         function getBiomeValue(x, z) {
+            const ix = Math.round(x), iz = Math.round(z);
+            const key = ix + ',' + iz;
+            const cached = biomeCache.get(key);
+            if (cached !== undefined) return cached;
             const n = (fbm(x / 160, z / 160, 7, 2) - 0.5) * 2.4;
             const spawnBias = Math.max(0, 1 - Math.hypot(x, z) / 100) * 0.9;
-            return n + spawnBias;
+            return cachePut(biomeCache, key, n + spawnBias);
         }
 
         // Biom pomarańczowy (łąki): tam, gdzie nie ma Sifta, wydzielamy duże plamy drugim szumem
-        function orangeNoise(x, z) { return fbm(x / 200 + 40, z / 200 - 25, 17, 2); }
-        function carapaceNoise(x, z) { return fbm(x / 300 - 90, z / 300 + 60, 29, 2); }
+        function orangeNoise(x, z) {
+            const key = 'o:' + Math.round(x) + ',' + Math.round(z);
+            const cached = noiseCache.get(key);
+            if (cached !== undefined) return cached;
+            return cachePut(noiseCache, key, fbm(x / 200 + 40, z / 200 - 25, 17, 2));
+        }
+        function carapaceNoise(x, z) {
+            const key = 'c:' + Math.round(x) + ',' + Math.round(z);
+            const cached = noiseCache.get(key);
+            if (cached !== undefined) return cached;
+            return cachePut(noiseCache, key, fbm(x / 300 - 90, z / 300 + 60, 29, 2));
+        }
         function isOrangeBiome(x, z) { return getBiomeValue(x, z) <= 0 && orangeNoise(x, z) > 0.56; }
         // Carapace (pustynia z wielkimi kośćmi): wycinany z obszarów, które nie są Siftem ani pomarańczową łąką
         function isCarapaceBiome(x, z) { return getBiomeValue(x, z) <= 0 && !(orangeNoise(x, z) > 0.56) && carapaceNoise(x, z) > 0.56; }
 
-        function lakeNoise(x, z) { return fbm(x / 48, z / 48, 4, 2); }
+        function lakeNoise(x, z) {
+            const key = 'l:' + Math.round(x) + ',' + Math.round(z);
+            const cached = noiseCache.get(key);
+            if (cached !== undefined) return cached;
+            return cachePut(noiseCache, key, fbm(x / 48, z / 48, 4, 2));
+        }
 
         function terrainHeight(x, z) {
+            const ix = Math.round(x), iz = Math.round(z);
+            const key = ix + ',' + iz;
+            const cached = terrainCache.get(key);
+            if (cached !== undefined) return cached;
             const cont = fbm(x / 200, z / 200, 1, 3);    // kontynenty – bardzo duża skala
             const hills = fbm(x / 64, z / 64, 2, 3);     // wzgórza
             const detail = fbm(x / 16, z / 16, 3, 2);    // drobne nierówności
@@ -2614,13 +2673,13 @@
             const lakeThr = LAKE_THRESHOLD + 0.04 - 0.14 * siftAmt - 0.04 * orangeAmt + 0.05 * carapaceAmt;   // łąka: jeziorka czasem, pustynia: rzadko   // różowy ≈ 0.84, Sift ≈ 0.70
             h += (WATER_LEVEL + 1 - h) * smooth01(lakeThr - 0.08, lakeThr, lake);
             h -= smooth01(lakeThr, lakeThr + 0.05, lake) * 5;
-            return Math.floor(h);
+            return cachePut(terrainCache, key, Math.floor(h));
         }
         function calculateHeight(cx, cz) { return terrainHeight(cx, cz); }
 
         // ---------- Jaskinie (szum 3D): wielkie komory + wijące się tunele; sculk na ścianach w ciemnych strefach ----------
         function hash3(ix, iy, iz, salt) {
-            let h = (Math.imul(ix | 0, 374761393) ^ Math.imul(iy | 0, 1103515245) ^ Math.imul(iz | 0, 668265263) ^ Math.imul((salt + WORLD_SEED) | 0, 1274126177)) | 0;
+            let h = (Math.imul(ix | 0, 374761393) ^ Math.imul(iy | 0, 1103515245) ^ Math.imul(iz | 0, 668265263) ^ Math.imul((salt + worldSeed) | 0, 1274126177)) | 0;
             h = Math.imul(h ^ (h >>> 13), 1274126177);
             h ^= h >>> 16;
             return (h >>> 0) / 4294967296;
@@ -2948,7 +3007,7 @@
             const biomeVal = getBiomeValue(cx, cz);
             const isSiftBiome = biomeVal > 0;
             if (!isSiftBiome && isCarapaceBiome(cx, cz)) return;   // pustynia bez roślin
-            const rand = Math.random();
+            const rand = hash2(cx, cz, 701);
 
             let nearWater = false;
             const neighbors = [[1, 0], [-1, 0], [0, 1], [0, -1]];
@@ -3862,7 +3921,7 @@
             updateGolemSpawns(pX, pZ);
             const playerChunkX = Math.floor(pX / 8);
             const playerChunkZ = Math.floor(pZ / 8);
-            const mobRenderDist = Math.floor(RENDER_DISTANCE / 4);
+            const mobRenderDist = Math.floor(renderDistance / 4);
 
             for (let cx = playerChunkX - mobRenderDist; cx <= playerChunkX + mobRenderDist; cx++) {
                 for (let cz = playerChunkZ - mobRenderDist; cz <= playerChunkZ + mobRenderDist; cz++) {
@@ -3905,7 +3964,7 @@
             mobs.forEach(mob => {
                 const distToPlayerX = Math.abs(mob.mesh.position.x - pX);
                 const distToPlayerZ = Math.abs(mob.mesh.position.z - pZ);
-                const outOfRange = distToPlayerX > (RENDER_DISTANCE + 4) * BLOCK_SIZE || distToPlayerZ > (RENDER_DISTANCE + 4) * BLOCK_SIZE;
+                const outOfRange = distToPlayerX > (renderDistance + 4) * BLOCK_SIZE || distToPlayerZ > (renderDistance + 4) * BLOCK_SIZE;
                 
                 mob.mesh.visible = !outOfRange || (mob.tamed && !mob.sitting);
             });
@@ -3918,159 +3977,234 @@
                    b(getBlockData(x, y, z + 1)) && b(getBlockData(x, y, z - 1));
         }
 
+        const activeColumnKeys = new Map();
+        const waterPlaneGeo = new THREE.PlaneGeometry(BLOCK_SIZE, BLOCK_SIZE);
+        waterPlaneGeo.rotateX(-Math.PI / 2);
+        const worldUpdate = {
+            centerX: 999999, centerYBand: 999999, centerZ: 999999,
+            genQueue: [], decQueue: [], meshQueue: [],
+            genSet: new Set(), decSet: new Set(), meshSet: new Set(),
+            lastMobUpdate: 0
+        };
+        function queueCoord(queue, set, x, z) {
+            const k = x + ',' + z;
+            if (set.has(k)) return;
+            set.add(k);
+            queue.push({ x, z, k });
+        }
+        function queueRings(queue, set, cx, cz, r) {
+            for (let d = 0; d <= r; d++) {
+                for (let x = cx - d; x <= cx + d; x++) {
+                    queueCoord(queue, set, x, cz - d);
+                    if (d > 0) queueCoord(queue, set, x, cz + d);
+                }
+                for (let z = cz - d + 1; z <= cz + d - 1; z++) {
+                    queueCoord(queue, set, cx - d, z);
+                    if (d > 0) queueCoord(queue, set, cx + d, z);
+                }
+            }
+        }
+        function resetWorldQueues() {
+            worldUpdate.genQueue.length = 0;
+            worldUpdate.decQueue.length = 0;
+            worldUpdate.meshQueue.length = 0;
+            worldUpdate.genSet.clear();
+            worldUpdate.decSet.clear();
+            worldUpdate.meshSet.clear();
+        }
+        function buildMeshAt(type, key, x, y, z) {
+            let mesh;
+            if (type === BLOCKS.FLOWER) {
+                mesh = createPlantMesh(flowerMaterial, 'normal');
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.SHORT_GRASS) {
+                mesh = createPlantMesh(shortGrassMaterial, 'normal');
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.TALL_GRASS) {
+                mesh = createPlantMesh(tallGrassMaterial, 'medium');
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.TURQUOISE_SHORT_GRASS) {
+                mesh = createPlantMesh(turquoiseShortGrassMaterial, 'normal');
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.TURQUOISE_TALL_GRASS) {
+                mesh = createPlantMesh(turquoiseTallGrassMaterial, 'medium');
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.ORANGE_SHORT_GRASS) {
+                mesh = createPlantMesh(orangeShortGrassMaterial, 'normal');
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.ORANGE_TALL_GRASS) {
+                mesh = createPlantMesh(orangeTallGrassMaterial, 'medium');
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.SIFT_FLOWER) {
+                mesh = createSiftFlowerMesh(x, z, true);
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.BLOOM) {
+                mesh = createPlantMesh(bloomMaterial, 'normal');
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.STICKS) {
+                mesh = createPlantMesh(sticksMaterial, 'normal');
+                mesh.position.set(x, y, z);
+            } else if (type === BLOCKS.CHEST) {
+                mesh = createChestMesh(key, x, y, z);
+            } else if (type === BLOCKS.FENCE) {
+                mesh = createFenceMesh(key, x, y, z);
+            } else if (type === BLOCKS.FENCE_GATE) {
+                mesh = createGateMesh(key, x, y, z);
+            } else if (type === BLOCKS.LADDER) {
+                mesh = createLadderMesh(key, x, y, z);
+            } else if (type === BLOCKS.SLAB || type === BLOCKS.BRICK_SLAB) {
+                mesh = createSlabMesh(key, x, y, z);
+            } else if (type === BLOCKS.STAIRS || type === BLOCKS.BRICK_STAIRS) {
+                mesh = createStairsMesh(key, x, y, z);
+            } else if (type === BLOCKS.STONE_WALL) {
+                mesh = createWallMesh(key, x, y, z);
+            } else if (type === BLOCKS.DOOR) {
+                mesh = createDoorMesh(key, x, y, z);
+            } else if (type === BLOCKS.TRAPDOOR) {
+                mesh = createTrapdoorMesh(key, x, y, z);
+            } else if (type === BLOCKS.BUTTON) {
+                mesh = createButtonMesh(key, x, y, z);
+            } else if (type === BLOCKS.PLATE) {
+                mesh = createPlateMesh(key, x, y, z);
+            } else if (type === BLOCKS.FURNACE) {
+                const fMats = materials[BLOCKS.FURNACE].slice();
+                const fState = furnaceStorage.get(key);
+                if (fState && fState.burn > 0) fMats[4] = furnaceLitMaterial;
+                mesh = new THREE.Mesh(blockGeometry, fMats);
+                mesh.position.set(x, y, z);
+                mesh.rotation.y = furnaceFacing.get(key) || 0;
+                mesh.castShadow = true; mesh.receiveShadow = true;
+            } else if (type === BLOCKS.WATER) {
+                mesh = new THREE.Mesh(waterPlaneGeo, waterMaterial);
+                mesh.position.set(x, y + 0.5, z);
+            } else {
+                mesh = new THREE.Mesh(blockGeometry, materials[type] || materials[BLOCKS.DIRT]);
+                mesh.position.set(x, y, z);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+            }
+            mesh.userData = { type, key };
+            scene.add(mesh);
+            activeMeshes.set(key, mesh);
+        }
+        function rebuildVisibleColumn(x, z, pY) {
+            const yMin = pY - 12, yMax = pY + 16;
+            const colKey = x + ',' + z;
+            const desired = new Set();
+            for (let y = yMin; y <= yMax; y++) {
+                const key = getBlockKey(x, y, z);
+                if (!worldBlocksData.has(key)) continue;
+                const type = worldBlocksData.get(key);
+                let skipBlock = false;
+                if (type === BLOCKS.WATER) {
+                    if (getBlockData(x, y + 1, z) === BLOCKS.WATER) skipBlock = true;
+                } else if (!isPlantBlock(type) && type !== BLOCKS.LEAVES) {
+                    const px = isTransparentBlock(getBlockData(x + 1, y, z));
+                    const nx = isTransparentBlock(getBlockData(x - 1, y, z));
+                    const py = isTransparentBlock(getBlockData(x, y + 1, z));
+                    const ny = isTransparentBlock(getBlockData(x, y - 1, z));
+                    const pz = isTransparentBlock(getBlockData(x, y, z + 1));
+                    const nz = isTransparentBlock(getBlockData(x, y, z - 1));
+                    if (!px && !nx && !py && !ny && !pz && !nz) skipBlock = true;
+                } else if (type === BLOCKS.LEAVES) {
+                    if (isLeafBuried(x, y, z)) skipBlock = true;
+                }
+                if (skipBlock) continue;
+                desired.add(key);
+                const cachedMesh = activeMeshes.get(key);
+                if (cachedMesh && cachedMesh.userData && cachedMesh.userData.type !== type) {
+                    scene.remove(cachedMesh);
+                    activeMeshes.delete(key);
+                }
+                if (!activeMeshes.has(key)) buildMeshAt(type, key, x, y, z);
+            }
+            const old = activeColumnKeys.get(colKey);
+            if (old) {
+                old.forEach((key) => {
+                    if (!desired.has(key)) {
+                        const mesh = activeMeshes.get(key);
+                        if (mesh) {
+                            scene.remove(mesh);
+                            activeMeshes.delete(key);
+                        }
+                    }
+                });
+            }
+            if (desired.size) activeColumnKeys.set(colKey, desired);
+            else activeColumnKeys.delete(colKey);
+        }
+        function pruneFarColumns(pX, pZ) {
+            let removed = 0;
+            const maxRemove = Math.max(24, worldColumnBudget);
+            activeColumnKeys.forEach((keys, colKey) => {
+                if (removed >= maxRemove) return;
+                const parts = colKey.split(',');
+                const x = Number(parts[0]), z = Number(parts[1]);
+                if (Math.abs(x - pX) <= renderDistance + 1 && Math.abs(z - pZ) <= renderDistance + 1) return;
+                keys.forEach((key) => {
+                    const mesh = activeMeshes.get(key);
+                    if (mesh) {
+                        scene.remove(mesh);
+                        activeMeshes.delete(key);
+                    }
+                });
+                activeColumnKeys.delete(colKey);
+                removed++;
+            });
+        }
+        function processWorldQueues(pY, forceReload) {
+            const genBudget = forceReload ? Math.max(worldColumnBudget * 3, 128) : worldColumnBudget;
+            const decBudget = Math.max(8, Math.floor(genBudget * 0.75));
+            const meshBudget = Math.max(18, Math.floor(genBudget * 1.35));
+            for (let i = 0; i < genBudget && worldUpdate.genQueue.length; i++) {
+                const c = worldUpdate.genQueue.shift();
+                worldUpdate.genSet.delete(c.k);
+                generateColumn(c.x, c.z);
+            }
+            for (let i = 0; i < decBudget && worldUpdate.decQueue.length; i++) {
+                const c = worldUpdate.decQueue.shift();
+                worldUpdate.decSet.delete(c.k);
+                generateDecoration(c.x, c.z);
+            }
+            for (let i = 0; i < meshBudget && worldUpdate.meshQueue.length; i++) {
+                const c = worldUpdate.meshQueue.shift();
+                worldUpdate.meshSet.delete(c.k);
+                generateColumn(c.x, c.z);
+                generateDecoration(c.x, c.z);
+                rebuildVisibleColumn(c.x, c.z, pY);
+            }
+        }
+        function scheduleWorldWindow(pX, pY, pZ) {
+            resetWorldQueues();
+            queueRings(worldUpdate.genQueue, worldUpdate.genSet, pX, pZ, renderDistance + 1);
+            queueRings(worldUpdate.decQueue, worldUpdate.decSet, pX, pZ, renderDistance + 1);
+            queueRings(worldUpdate.meshQueue, worldUpdate.meshSet, pX, pZ, renderDistance);
+            worldUpdate.centerX = pX;
+            worldUpdate.centerYBand = pY;
+            worldUpdate.centerZ = pZ;
+        }
         function updateRenderDistance(forceReload = false) {
             const pX = Math.round(camera.position.x);
             const pY = Math.round(camera.position.y);
             const pZ = Math.round(camera.position.z);
-
+            const centerX = Math.floor(pX / UPDATE_STEP);
+            const centerYBand = Math.floor(pY / 6);
+            const centerZ = Math.floor(pZ / UPDATE_STEP);
             skyDome.position.set(pX, 0, pZ);
-
-            if (!forceReload && player.lastChunkX === pX && player.lastChunkY === pY && player.lastChunkZ === pZ) return;
-            player.lastChunkX = pX; player.lastChunkY = pY; player.lastChunkZ = pZ;
-
-            for (let x = pX - RENDER_DISTANCE - 1; x <= pX + RENDER_DISTANCE + 1; x++) {
-                for (let z = pZ - RENDER_DISTANCE - 1; z <= pZ + RENDER_DISTANCE + 1; z++) {
-                    generateColumn(x, z);
-                }
+            const movedCenter = player.lastChunkX !== centerX || player.lastChunkY !== centerYBand || player.lastChunkZ !== centerZ;
+            if (forceReload || movedCenter) {
+                player.lastChunkX = centerX;
+                player.lastChunkY = centerYBand;
+                player.lastChunkZ = centerZ;
+                scheduleWorldWindow(pX, pY, pZ);
             }
-            for (let x = pX - RENDER_DISTANCE - 1; x <= pX + RENDER_DISTANCE + 1; x++) {
-                for (let z = pZ - RENDER_DISTANCE - 1; z <= pZ + RENDER_DISTANCE + 1; z++) {
-                    generateDecoration(x, z);
-                }
+            processWorldQueues(pY, forceReload);
+            pruneFarColumns(pX, pZ);
+            const now = performance.now();
+            if (forceReload || movedCenter || now - worldUpdate.lastMobUpdate > 250) {
+                worldUpdate.lastMobUpdate = now;
+                updateMobsForChunks(pX, pZ);
             }
-
-            const currentKeysInView = new Set();
-            for (let x = pX - RENDER_DISTANCE; x <= pX + RENDER_DISTANCE; x++) {
-                for (let z = pZ - RENDER_DISTANCE; z <= pZ + RENDER_DISTANCE; z++) {
-                    for (let y = pY - 12; y <= pY + 16; y++) {
-                        const key = getBlockKey(x, y, z);
-                        if (worldBlocksData.has(key)) {
-                            const type = worldBlocksData.get(key);
-                            
-                            let skipBlock = false;
-                            if (type === BLOCKS.WATER) {
-                                const py = getBlockData(x, y + 1, z);
-                                if (py === BLOCKS.WATER) {
-                                    skipBlock = true;
-                                }
-                            } else if (!isPlantBlock(type) && type !== BLOCKS.LEAVES) {
-                                const px = isTransparentBlock(getBlockData(x + 1, y, z));
-                                const nx = isTransparentBlock(getBlockData(x - 1, y, z));
-                                const py = isTransparentBlock(getBlockData(x, y + 1, z));
-                                const ny = isTransparentBlock(getBlockData(x, y - 1, z));
-                                const pz = isTransparentBlock(getBlockData(x, y, z + 1));
-                                const nz = isTransparentBlock(getBlockData(x, y, z - 1));
-                                if (!px && !nx && !py && !ny && !pz && !nz) {
-                                    skipBlock = true;
-                                }
-                            } else if (type === BLOCKS.LEAVES) {
-                                if (isLeafBuried(x, y, z)) skipBlock = true;
-                            }
-
-                            if (!skipBlock) {
-                                currentKeysInView.add(key);
-                                const cachedMesh = activeMeshes.get(key);
-                                if (cachedMesh && cachedMesh.userData && cachedMesh.userData.type !== type) {
-                                    scene.remove(cachedMesh);
-                                    activeMeshes.delete(key);
-                                }
-                                if (!activeMeshes.has(key)) {
-                                    let mesh;
-                                    if (type === BLOCKS.FLOWER) {
-                                        mesh = createPlantMesh(flowerMaterial, 'normal');
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.SHORT_GRASS) {
-                                        mesh = createPlantMesh(shortGrassMaterial, 'normal');
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.TALL_GRASS) {
-                                        mesh = createPlantMesh(tallGrassMaterial, 'medium');
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.TURQUOISE_SHORT_GRASS) {
-                                        mesh = createPlantMesh(turquoiseShortGrassMaterial, 'normal');
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.TURQUOISE_TALL_GRASS) {
-                                        mesh = createPlantMesh(turquoiseTallGrassMaterial, 'medium');
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.ORANGE_SHORT_GRASS) {
-                                        mesh = createPlantMesh(orangeShortGrassMaterial, 'normal');
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.ORANGE_TALL_GRASS) {
-                                        mesh = createPlantMesh(orangeTallGrassMaterial, 'medium');
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.SIFT_FLOWER) {
-                                        mesh = createSiftFlowerMesh(x, z, true);
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.BLOOM) {
-                                        mesh = createPlantMesh(bloomMaterial, 'normal');
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.STICKS) {
-                                        mesh = createPlantMesh(sticksMaterial, 'normal');
-                                        mesh.position.set(x, y, z);
-                                    } else if (type === BLOCKS.CHEST) {
-                                        mesh = createChestMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.FENCE) {
-                                        mesh = createFenceMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.FENCE_GATE) {
-                                        mesh = createGateMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.LADDER) {
-                                        mesh = createLadderMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.SLAB) {
-                                        mesh = createSlabMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.STAIRS) {
-                                        mesh = createStairsMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.BRICK_SLAB) {
-                                        mesh = createSlabMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.BRICK_STAIRS) {
-                                        mesh = createStairsMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.STONE_WALL) {
-                                        mesh = createWallMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.DOOR) {
-                                        mesh = createDoorMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.TRAPDOOR) {
-                                        mesh = createTrapdoorMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.BUTTON) {
-                                        mesh = createButtonMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.PLATE) {
-                                        mesh = createPlateMesh(key, x, y, z);
-                                    } else if (type === BLOCKS.FURNACE) {
-                                        const fMats = materials[BLOCKS.FURNACE].slice();
-                                        const fState = furnaceStorage.get(key);
-                                        if (fState && fState.burn > 0) fMats[4] = furnaceLitMaterial;
-                                        mesh = new THREE.Mesh(blockGeometry, fMats);
-                                        mesh.position.set(x, y, z);
-                                        mesh.rotation.y = furnaceFacing.get(key) || 0;
-                                        mesh.castShadow = true; mesh.receiveShadow = true;
-                                    } else if (type === BLOCKS.WATER) {
-                                        const waterPlaneGeo = new THREE.PlaneGeometry(BLOCK_SIZE, BLOCK_SIZE);
-                                        waterPlaneGeo.rotateX(-Math.PI / 2);
-                                        mesh = new THREE.Mesh(waterPlaneGeo, waterMaterial);
-                                        mesh.position.set(x, y + 0.5, z);
-                                    } else {
-                                        mesh = new THREE.Mesh(blockGeometry, materials[type] || materials[BLOCKS.DIRT]);
-                                        mesh.position.set(x, y, z);
-                                        if (type !== BLOCKS.WATER) {
-                                            mesh.castShadow = true;
-                                            mesh.receiveShadow = true;
-                                        }
-                                    }
-                                    mesh.userData = { type, key };
-                                    scene.add(mesh);
-                                    activeMeshes.set(key, mesh);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            activeMeshes.forEach((mesh, key) => {
-                if (!currentKeysInView.has(key)) {
-                    scene.remove(mesh);
-                    if (mesh.geometry) mesh.geometry.dispose();
-                    activeMeshes.delete(key);
-                }
-            });
-
-            updateMobsForChunks(pX, pZ);
         }
 
         function findGroundY(x, z) {
@@ -7583,6 +7717,10 @@
             A.model.position.set(0, 0.675 * (1 - Math.cos(S.tilt)), -0.675 * Math.sin(S.tilt));
         }
 
+        const perfDebugEl = document.getElementById('perf-debug');
+        let coordHudTimer = 0, perfHudTimer = 0;
+        let fpsFrames = 0, fpsAccum = 0, fpsValue = 0;
+
         function animate() {
             requestAnimationFrame(animate);
             const delta = Math.min(clock.getDelta(), 0.1);
@@ -7817,7 +7955,6 @@
                 }
 
                 camera.position.copy(player.position).add(new THREE.Vector3(0, player.height - 0.2, 0));
-                updateRenderDistance();
             }
 
             if (placeAnimTimer > 0) {
@@ -7865,8 +8002,25 @@
             }
             updateCrumbs(delta);
 
-            document.getElementById('coordinates').innerText = 
-                `X: ${player.position.x.toFixed(1)} | Y: ${player.position.y.toFixed(1)} | Z: ${player.position.z.toFixed(1)}`;
+            updateRenderDistance();
+            coordHudTimer -= delta;
+            if (coordHudTimer <= 0) {
+                coordHudTimer = 0.12;
+                document.getElementById('coordinates').innerText =
+                    `X: ${player.position.x.toFixed(1)} | Y: ${player.position.y.toFixed(1)} | Z: ${player.position.z.toFixed(1)}`;
+            }
+            fpsFrames++;
+            fpsAccum += delta;
+            if (fpsAccum >= 0.5) {
+                fpsValue = Math.round(fpsFrames / fpsAccum);
+                fpsFrames = 0;
+                fpsAccum = 0;
+            }
+            perfHudTimer -= delta;
+            if (showPerfDebug && perfHudTimer <= 0) {
+                perfHudTimer = 0.2;
+                perfDebugEl.innerText = `FPS: ${fpsValue || '--'} | Bloki: ${activeMeshes.size} | Obiekty: ${scene.children.length}`;
+            }
 
             updateMobs(delta);
             updateHostileFx(delta);
@@ -7902,6 +8056,9 @@ function saveGameToFile() {
                     z: player.position.z
                 },
                 worldTicks: worldTicks,
+                worldSeed: worldSeed,
+                renderDistance: renderDistance,
+                worldColumnBudget: worldColumnBudget,
                 inventory: inventory,
                 worldBlocks: Array.from(worldBlocksData.entries()),
                 chests: Array.from(chestStorage.entries()),
@@ -7940,6 +8097,19 @@ function saveGameToFile() {
                     }
 
                     if (typeof saveData.worldTicks === 'number') worldTicks = saveData.worldTicks;
+                    if (Number.isFinite(saveData.worldSeed)) {
+                        worldSeed = (saveData.worldSeed | 0) || DEFAULT_WORLD_SEED;
+                        localStorage.setItem('sift_world_seed', String(worldSeed));
+                        clearWorldGenCaches();
+                    }
+                    if (Number.isFinite(saveData.renderDistance)) {
+                        renderDistance = Math.max(8, Math.min(32, Math.round(saveData.renderDistance)));
+                        localStorage.setItem('sift_render_distance', String(renderDistance));
+                    }
+                    if (Number.isFinite(saveData.worldColumnBudget)) {
+                        worldColumnBudget = Math.max(8, Math.min(220, Math.round(saveData.worldColumnBudget)));
+                        localStorage.setItem('sift_world_budget', String(worldColumnBudget));
+                    }
                     if (saveData.survival) {
                         const sv = saveData.survival;
                         survival.health = Math.max(1, Math.min(20, +sv.health || 20));
@@ -7961,11 +8131,13 @@ function saveGameToFile() {
                     if (saveData.worldBlocks) {
                         activeMeshes.forEach((mesh) => {
                             scene.remove(mesh);
-                            if (mesh.geometry) mesh.geometry.dispose();
                         });
                         activeMeshes.clear();
+                        activeColumnKeys.clear();
                         worldBlocksData.clear();
                         generatedColumns.clear();
+                        clearWorldGenCaches();
+                        resetWorldQueues();
 
                         saveData.worldBlocks.forEach(([key, type]) => {
                             worldBlocksData.set(key, type);
@@ -8016,6 +8188,7 @@ function saveGameToFile() {
                     player.lastChunkZ = 9999;
 
                     // Odświeżenie interfejsu
+                    syncWorldSettingsUI();
                     updateHUD();
                     updateHeldItemModel();
                     updateRenderDistance(true);
@@ -8155,6 +8328,56 @@ function saveGameToFile() {
             toggleSettings(); // Zamknij menu ustawień po wyborze języka
             showGameMessage(lang === 'en' ? 'Language changed to English' : 'Zmieniono język na polski');
         }
+
+        function syncWorldSettingsUI() {
+            const seedInput = document.getElementById('world-seed-input');
+            const rdInput = document.getElementById('render-distance-input');
+            const budgetInput = document.getElementById('world-budget-input');
+            const dbgBtn = document.getElementById('debug-overlay-btn');
+            if (seedInput) seedInput.value = String(worldSeed | 0);
+            if (rdInput) rdInput.value = String(renderDistance);
+            if (budgetInput) budgetInput.value = String(worldColumnBudget);
+            if (dbgBtn) dbgBtn.textContent = `📊 Debug HUD: ${showPerfDebug ? 'ON' : 'OFF'}`;
+            if (perfDebugEl) perfDebugEl.style.display = showPerfDebug ? 'block' : 'none';
+        }
+        function applyWorldSeedSettings() {
+            if (MP.active) {
+                showGameMessage(mpT('Seed świata w multiplayerze jest wspólny i nie może być zmieniony lokalnie.', 'World seed is shared in multiplayer and cannot be changed locally.'));
+                return;
+            }
+            const seedInput = document.getElementById('world-seed-input');
+            if (!seedInput) return;
+            const parsed = Math.trunc(Number(seedInput.value));
+            if (!Number.isFinite(parsed)) return;
+            worldSeed = (parsed | 0) || DEFAULT_WORLD_SEED;
+            localStorage.setItem('sift_world_seed', String(worldSeed));
+            clearWorldGenCaches();
+            resetWorldQueues();
+            player.lastChunkX = player.lastChunkY = player.lastChunkZ = 9999;
+            updateRenderDistance(true);
+            showGameMessage(mpT('Zastosowano seed świata: ', 'World seed applied: ') + worldSeed);
+            syncWorldSettingsUI();
+        }
+        function applyPerformanceSettings() {
+            const rdInput = document.getElementById('render-distance-input');
+            const budgetInput = document.getElementById('world-budget-input');
+            if (!rdInput || !budgetInput) return;
+            renderDistance = Math.max(8, Math.min(32, Math.round(Number(rdInput.value) || DEFAULT_RENDER_DISTANCE)));
+            worldColumnBudget = Math.max(8, Math.min(220, Math.round(Number(budgetInput.value) || 84)));
+            localStorage.setItem('sift_render_distance', String(renderDistance));
+            localStorage.setItem('sift_world_budget', String(worldColumnBudget));
+            resetWorldQueues();
+            player.lastChunkX = player.lastChunkY = player.lastChunkZ = 9999;
+            updateRenderDistance(true);
+            showGameMessage(mpT('Ustawienia wydajności zapisane.', 'Performance settings saved.'));
+            syncWorldSettingsUI();
+        }
+        function toggleDebugOverlay() {
+            showPerfDebug = !showPerfDebug;
+            localStorage.setItem('sift_show_perf_debug', showPerfDebug ? '1' : '0');
+            syncWorldSettingsUI();
+        }
+        syncWorldSettingsUI();
 
         let isSettingsOpen = false;
         function toggleSettings() {
@@ -8389,15 +8612,15 @@ function saveGameToFile() {
             let created = false;
             if (!w) {
                 mpSetStatus(mpT('Pierwsze uruchomienie – tworzę zapis serwera…', 'First run – creating the server save…'));
-                const info = { version: 1, seed: WORLD_SEED, created: Date.now(), name: 'Siftcraft server' };
+                const info = { version: 1, seed: DEFAULT_WORLD_SEED, created: Date.now(), name: 'Siftcraft server' };
                 try { await mpGH.putText('server/world.json', JSON.stringify(info), 'Create server'); created = true; }
                 catch (e) { /* ktoś był szybszy */ }
                 w = await mpGH.getFile('server/world.json');
                 if (!w) throw new Error(mpT('Nie udało się utworzyć zapisu serwera.', 'Could not create the server save.'));
             }
             const world = JSON.parse(w.text);
-            if (world.seed !== WORLD_SEED) throw new Error(mpT('Serwer używa innego świata (seed ' + world.seed + ') niż ta wersja gry (' + WORLD_SEED + ').',
-                                                               'The server uses a different world (seed ' + world.seed + ') than this game version (' + WORLD_SEED + ').'));
+            if (world.seed !== DEFAULT_WORLD_SEED) throw new Error(mpT('Serwer używa innego świata (seed ' + world.seed + ') niż ta wersja gry (' + DEFAULT_WORLD_SEED + ').',
+                                                                       'The server uses a different world (seed ' + world.seed + ') than this game version (' + DEFAULT_WORLD_SEED + ').'));
             world.__created = created;
             return world;
         }
