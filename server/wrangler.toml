@@ -1,0 +1,17 @@
+name = "siftcraft-server"
+main = "worker.js"
+compatibility_date = "2025-06-01"
+
+[vars]
+SERVER_NAME = "Siftcraft Official Server"
+MOTD = "Witaj w Sifcie! / Welcome to the Sift!"
+MAX_PLAYERS = "8"
+GH_REPO = "piesiulko/Siftcraft-server"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "SiftRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SiftRoom"]
